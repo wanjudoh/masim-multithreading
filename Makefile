@@ -4,7 +4,7 @@ APPS	:= masim
 MASIM	:= masim
 
 CC	:= gcc
-CFLAGS	:= -g -I$(IDIR) -O3 -Wall -Werror -std=gnu99
+CFLAGS	:= -g -I$(IDIR) -O3 -Wall -Werror -std=gnu99 -pthread
 
 OBJ_MSM	:= masim.o misc.o
 

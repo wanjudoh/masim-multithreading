@@ -1,11 +1,15 @@
 #ifndef _MASIM_H
 #define _MASIM_H
 
+#define MAX_THREADS 128
+
 struct mregion {
 	char name[256];
 	size_t sz;
 	char *region;
 	char *data_file;
+
+	size_t sub_sz;
 };
 
 enum rw_mode {
@@ -23,7 +27,7 @@ struct access {
 
 	/* For runtime only */
 	int prob_start;
-	size_t last_offset;
+	size_t last_offset[MAX_THREADS];
 };
 
 struct phase {

@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "misc.h"
 #include "masim.h"
@@ -26,6 +27,15 @@
 int use_hugetlb = 0;
 
 #define LEN_ARRAY(x) (sizeof(x) / sizeof(*x))
+
+#define MIN_SUB_REGION_SZ (2 * 1024 * 1024) // 2MB
+
+int num_threads = 1;
+struct thread_context {
+	int tid;
+	struct access_config *config;
+	struct phase *phase;
+};
 
 enum hintmethod {
 	NONE,
@@ -127,158 +137,114 @@ struct access_config {
 	ssize_t nr_phases;
 };
 
-size_t **rndints;
-
-inline static size_t rand64() {
-	return ((size_t)rand() << 32) | rand();
-}
-
-static void init_rndints(void)
-{
-	int i, j;
-
-	rndints = malloc(sizeof(rndints) * rand_batch);
-	for (i = 0; i < rand_batch; i++) {
-		rndints[i] = malloc(sizeof(rndints[0]) * rand_arr_sz);
-		for (j = 0; j < rand_arr_sz; j++)
-			rndints[i][j] = rand64();
-	}
-	rndints[0][0] = 1;
-}
-
-static void fini_rndints(void)
-{
-	int i;
-
-	for (i = 0; i < rand_batch; i++)
-		free(rndints[i]);
-	free(rndints);
-}
-
-/*
- * Returns a random integer
- */
-static size_t rndint(void)
-{
-	static int rndofs;
-	static int rndarr;
-
-	if (rndofs == rand_arr_sz) {
-		rndarr = rand() % rand_batch;
-		rndofs = 0;
-	}
-
-	return rndints[rndarr][rndofs++];
-}
-
-static void do_rnd_ro(struct access *access)
+static void do_rnd_ro(struct access *access, int tid, int randn)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
+	char *rr = region->region + tid * region->sub_sz;
 	int i;
 	char __attribute__((unused)) read_val;
 
 	for (i = 0; i < nr_accesses_per_region; i++)
-		read_val = ACCESS_ONCE(rr[rndint() % region->sz]);
+		read_val = ACCESS_ONCE(rr[randn % region->sub_sz]);
 }
 
-static void do_seq_ro(struct access *access)
+static void do_seq_ro(struct access *access, int tid)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
-	size_t offset = access->last_offset;
+	char *rr = region->region + tid * region->sub_sz;
+	size_t offset = access->last_offset[tid];
 	int i;
 	char __attribute__((unused)) read_val;
 
 	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
-		if (offset >= region->sz)
+		if (offset >= region->sub_sz)
 			offset = 0;
 		read_val = ACCESS_ONCE(rr[offset]);
 	}
-	access->last_offset = offset;
+	access->last_offset[tid] = offset;
 }
 
-static void do_rnd_wo(struct access *access)
+static void do_rnd_wo(struct access *access, int tid, int randn)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
+	char *rr = region->region + tid * region->sub_sz;
 	int i;
 
 	for (i = 0; i < nr_accesses_per_region; i++)
-		ACCESS_ONCE(rr[rndint() % region->sz]) = 1;
+		ACCESS_ONCE(rr[randn % region->sub_sz]) = 1;
 }
 
-static void do_seq_wo(struct access *access)
+static void do_seq_wo(struct access *access, int tid)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
-	size_t offset = access->last_offset;
+	char *rr = region->region + tid * region->sub_sz;
+	size_t offset = access->last_offset[tid];
 	int i;
 
 	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
-		if (offset >= region->sz)
+		if (offset >= region->sub_sz)
 			offset = 0;
 		ACCESS_ONCE(rr[offset]) = 1;
 	}
-	access->last_offset = offset;
+	access->last_offset[tid] = offset;
 }
 
-static void do_rnd_rw(struct access *access)
+static void do_rnd_rw(struct access *access, int tid, int randn)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
+	char *rr = region->region + tid * region->sub_sz;
 	int i;
 	char read_val;
 
 	for (i = 0; i < nr_accesses_per_region; i++) {
 		size_t rndoffset;
 
-		rndoffset = rndint() % region->sz;
+		rndoffset = randn % region->sub_sz;
 		read_val = ACCESS_ONCE(rr[rndoffset]);
 		ACCESS_ONCE(rr[rndoffset]) = read_val + 1;
 	}
 }
 
-static void do_seq_rw(struct access *access)
+static void do_seq_rw(struct access *access, int tid)
 {
 	struct mregion *region = access->mregion;
-	char *rr = region->region;
-	size_t offset = access->last_offset;
+	char *rr = region->region + tid * region->sub_sz;
+	size_t offset = access->last_offset[tid];
 	int i;
 	char read_val;
 
 	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
-		if (offset >= region->sz)
+		if (offset >= region->sub_sz)
 			offset = 0;
 		read_val = ACCESS_ONCE(rr[offset]);
 		ACCESS_ONCE(rr[offset]) = read_val + 1;
 	}
-	access->last_offset = offset;
+	access->last_offset[tid] = offset;
 }
 
-static unsigned long long do_access(struct access *access)
+static unsigned long long do_access(struct access *access, int tid, int randn)
 {
 	switch (access->rw_mode) {
 	case READ_ONLY:
 		if (access->random_access)
-			do_rnd_ro(access);
+			do_rnd_ro(access, tid, randn);
 		else
-			do_seq_ro(access);
+			do_seq_ro(access, tid);
 		break;
 	case WRITE_ONLY:
 		if (access->random_access)
-			do_rnd_wo(access);
+			do_rnd_wo(access, tid, randn);
 		else
-			do_seq_wo(access);
+			do_seq_wo(access, tid);
 		break;
 	case READ_WRITE:
 		if (access->random_access)
-			do_rnd_rw(access);
+			do_rnd_rw(access, tid, randn);
 		else
-			do_seq_rw(access);
+			do_seq_rw(access, tid);
 		break;
 	default:
 		break;
@@ -332,14 +298,27 @@ void hint_access_pattern(struct phase *phase)
 	}
 }
 
-void exec_phase(struct phase *phase)
+void exec_phase(struct phase *phase, int tid)
 {
 	struct access *pattern;
 	unsigned long long nr_access, nr_last_logged_access = 0;
 	unsigned long long start, now, last_log_time;
 	int randn;
-	size_t i;
+	size_t i, j;
 	static unsigned long long cpu_cycle_ms;
+
+	unsigned int seed = (unsigned int)(uintptr_t)pthread_self() ^
+		(unsigned int)clock() ^ (unsigned int)time(NULL);
+
+	// thread-local random data initialization
+	size_t **rndints;
+	int rndofs = 0, rndarr = 0;
+	rndints = malloc(sizeof(rndints) * rand_batch);
+	for (i = 0; i < rand_batch; i++) {
+		rndints[i] = malloc(sizeof(rndints[0]) * rand_arr_sz);
+		for (j = 0; j < rand_arr_sz; j++)
+			rndints[i][j] = rand_r(&seed);
+	}
 
 	if (!cpu_cycle_ms)
 		cpu_cycle_ms = aclk_freq() / 1000;
@@ -352,8 +331,13 @@ void exec_phase(struct phase *phase)
 		hint_access_pattern(phase);
 
 	while (1) {
-		if (phase->total_probability)
-			randn = rndint() % phase->total_probability;
+		if (phase->total_probability) {
+			if (rndofs == rand_arr_sz) {
+				rndarr = rand_r(&seed) % rand_batch;
+				rndofs = 0;
+			}
+			randn = rndints[rndarr][rndofs++] % phase->total_probability;
+		}
 		else
 			randn = -1;
 		for (i = 0; i < phase->nr_patterns; i++) {
@@ -363,7 +347,7 @@ void exec_phase(struct phase *phase)
 			prob_start = pattern->prob_start;
 			prob_end = prob_start + pattern->probability;
 			if (randn >= prob_start && randn < prob_end)
-				nr_access += do_access(pattern);
+				nr_access += do_access(pattern, tid, rand_r(&seed));
 		}
 
 		now = aclk_clock();
@@ -386,6 +370,18 @@ void exec_phase(struct phase *phase)
 				nr_access /
 				((aclk_clock() - start) / cpu_cycle_ms),
 				((aclk_clock() - start) / cpu_cycle_ms));
+
+	free(rndints);
+}
+
+void *thread_worker(void *arg) {
+    struct thread_context *ctx = (struct thread_context *)arg;
+	struct phase *phase = ctx->phase;
+    int tid = ctx->tid;
+
+    exec_phase(phase, tid);
+
+    return NULL;
 }
 
 static void repeat_data(struct mregion *region, size_t data_filled)
@@ -438,6 +434,12 @@ static void load_init_data(struct mregion *region)
 
 static void init_region(struct mregion *region)
 {
+	if (region->sz / num_threads < MIN_SUB_REGION_SZ) {
+		fprintf(stderr, "Error: Region '%s' size (%zu) divided by threads (%d) is less than 2MB.\n",
+				region->name, region->sz, num_threads);
+		exit(1);
+	}
+
 	if (use_hugetlb) {
 		region->region = mmap(HUGETLB_ADDR, region->sz,
 				HUGETLB_PROTECTION, HUGETLB_FLAGS, -1,
@@ -447,8 +449,18 @@ static void init_region(struct mregion *region)
 			exit(1);
 		}
 	} else {
-		region->region = (char *)malloc(region->sz);
+		if (posix_memalign((void **)&region->region, MIN_SUB_REGION_SZ, region->sz) != 0) {
+			perror("posix_memalign");
+			exit(1);
+		}
 	}
+	region->sub_sz = region->sz / num_threads;
+
+	if (region->region == NULL) {
+		perror("malloc");
+		exit(1);
+	}
+
 	load_init_data(region);
 }
 
@@ -457,11 +469,23 @@ void exec_config(struct access_config *config)
 	struct mregion *region;
 	size_t i;
 
+	pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
+	struct thread_context *ctxs = malloc(sizeof(struct thread_context) * num_threads);
+
 	for (i = 0; i < config->nr_regions; i++)
 		init_region(&config->regions[i]);
 
-	for (i = 0; i < config->nr_phases; i++)
-		exec_phase(&config->phases[i]);
+	for (i = 0; i < config->nr_phases; i++) {
+		for (int t = 0; t < num_threads; t++) {
+			ctxs[t].tid = t;
+			ctxs[t].config = config;
+			ctxs[t].phase = &config->phases[i];
+			pthread_create(&threads[t], NULL, thread_worker, &ctxs[t]);
+		}
+		for (int i = 0; i < num_threads; i++) {
+			pthread_join(threads[i], NULL);
+		}
+	}
 
 	for (i = 0; i < config->nr_regions; i++) {
 		region = &config->regions[i];
@@ -470,6 +494,9 @@ void exec_config(struct access_config *config)
 		else
 			free(region->region);
 	}
+
+	free(threads);
+	free(ctxs);
 }
 
 size_t len_line(char *str, size_t lim_seek)
@@ -657,7 +684,8 @@ int parse_phase(char *lines[], int nr_lines, struct phase *p,
 			a->rw_mode = default_rw_mode;
 		}
 		a->prob_start = p->total_probability;
-		a->last_offset = 0;
+		for (k = 0; k < num_threads; k++)
+			a->last_offset[k] = 0;
 		lines++;
 		astr_free_str_array(fields, nr_fields);
 		p->total_probability += a->probability;
@@ -846,6 +874,14 @@ static struct argp_option options[] = {
 		.doc = "number of acceses to do per selected region",
 		.group = 0,
 	},
+	{
+		.name = "num_threads",
+		.key = 'n',
+		.arg = "<int>",
+		.flags = 0,
+		.doc = "number of threads to use",
+		.group = 0,
+	},
 
 	{}
 };
@@ -915,6 +951,12 @@ error_t parse_option(int key, char *arg, struct argp_state *state)
 	case 4:
 		nr_accesses_per_region = atoi(arg);
 		break;
+	case 'n':
+		num_threads = atoi(arg);
+		if (num_threads < 1) {
+			num_threads = 1;
+		}
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -948,9 +990,7 @@ int main(int argc, char *argv[])
 		if (dryrun)
 			return 0;
 
-		init_rndints();
 		exec_config(&config);
-		fini_rndints();
 	}
 
 	return 0;
