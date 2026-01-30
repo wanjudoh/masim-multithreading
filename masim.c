@@ -137,15 +137,17 @@ struct access_config {
 	ssize_t nr_phases;
 };
 
-static void do_rnd_ro(struct access *access, int tid, int randn)
+static void do_rnd_ro(struct access *access, int tid, unsigned int *seed)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region + tid * region->sub_sz;
 	int i;
 	char __attribute__((unused)) read_val;
 
-	for (i = 0; i < nr_accesses_per_region; i++)
-		read_val = ACCESS_ONCE(rr[randn % region->sub_sz]);
+	for (i = 0; i < nr_accesses_per_region; i++) {
+		size_t off = rand_r(seed) % region->sub_sz;
+		read_val = ACCESS_ONCE(rr[off]);
+	}
 }
 
 static void do_seq_ro(struct access *access, int tid)
@@ -165,14 +167,15 @@ static void do_seq_ro(struct access *access, int tid)
 	access->last_offset[tid] = offset;
 }
 
-static void do_rnd_wo(struct access *access, int tid, int randn)
+static void do_rnd_wo(struct access *access, int tid, unsigned int *seed)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region + tid * region->sub_sz;
 	int i;
 
-	for (i = 0; i < nr_accesses_per_region; i++)
-		ACCESS_ONCE(rr[randn % region->sub_sz]) = 1;
+	for (i = 0; i < nr_accesses_per_region; i++) {
+		ACCESS_ONCE(rr[rand_r(seed) % region->sub_sz]) = 1;
+	}
 }
 
 static void do_seq_wo(struct access *access, int tid)
@@ -191,7 +194,7 @@ static void do_seq_wo(struct access *access, int tid)
 	access->last_offset[tid] = offset;
 }
 
-static void do_rnd_rw(struct access *access, int tid, int randn)
+static void do_rnd_rw(struct access *access, int tid, unsigned int *seed)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region + tid * region->sub_sz;
@@ -201,7 +204,7 @@ static void do_rnd_rw(struct access *access, int tid, int randn)
 	for (i = 0; i < nr_accesses_per_region; i++) {
 		size_t rndoffset;
 
-		rndoffset = randn % region->sub_sz;
+		rndoffset = rand_r(seed) % region->sub_sz;
 		read_val = ACCESS_ONCE(rr[rndoffset]);
 		ACCESS_ONCE(rr[rndoffset]) = read_val + 1;
 	}
@@ -225,24 +228,24 @@ static void do_seq_rw(struct access *access, int tid)
 	access->last_offset[tid] = offset;
 }
 
-static unsigned long long do_access(struct access *access, int tid, int randn)
+static unsigned long long do_access(struct access *access, int tid, unsigned int *seed)
 {
 	switch (access->rw_mode) {
 	case READ_ONLY:
 		if (access->random_access)
-			do_rnd_ro(access, tid, randn);
+			do_rnd_ro(access, tid, seed);
 		else
 			do_seq_ro(access, tid);
 		break;
 	case WRITE_ONLY:
 		if (access->random_access)
-			do_rnd_wo(access, tid, randn);
+			do_rnd_wo(access, tid, seed);
 		else
 			do_seq_wo(access, tid);
 		break;
 	case READ_WRITE:
 		if (access->random_access)
-			do_rnd_rw(access, tid, randn);
+			do_rnd_rw(access, tid, seed);
 		else
 			do_seq_rw(access, tid);
 		break;
@@ -304,21 +307,11 @@ void exec_phase(struct phase *phase, int tid)
 	unsigned long long nr_access, nr_last_logged_access = 0;
 	unsigned long long start, now, last_log_time;
 	int randn;
-	size_t i, j;
+	size_t i;
 	static unsigned long long cpu_cycle_ms;
 
 	unsigned int seed = (unsigned int)(uintptr_t)pthread_self() ^
 		(unsigned int)clock() ^ (unsigned int)time(NULL);
-
-	// thread-local random data initialization
-	size_t **rndints;
-	int rndofs = 0, rndarr = 0;
-	rndints = malloc(sizeof(rndints) * rand_batch);
-	for (i = 0; i < rand_batch; i++) {
-		rndints[i] = malloc(sizeof(rndints[0]) * rand_arr_sz);
-		for (j = 0; j < rand_arr_sz; j++)
-			rndints[i][j] = rand_r(&seed);
-	}
 
 	if (!cpu_cycle_ms)
 		cpu_cycle_ms = aclk_freq() / 1000;
@@ -332,11 +325,7 @@ void exec_phase(struct phase *phase, int tid)
 
 	while (1) {
 		if (phase->total_probability) {
-			if (rndofs == rand_arr_sz) {
-				rndarr = rand_r(&seed) % rand_batch;
-				rndofs = 0;
-			}
-			randn = rndints[rndarr][rndofs++] % phase->total_probability;
+			randn = rand_r(&seed) % phase->total_probability;
 		}
 		else
 			randn = -1;
@@ -347,7 +336,7 @@ void exec_phase(struct phase *phase, int tid)
 			prob_start = pattern->prob_start;
 			prob_end = prob_start + pattern->probability;
 			if (randn >= prob_start && randn < prob_end)
-				nr_access += do_access(pattern, tid, rand_r(&seed));
+				nr_access += do_access(pattern, tid, &seed);
 		}
 
 		now = aclk_clock();
@@ -370,8 +359,6 @@ void exec_phase(struct phase *phase, int tid)
 				nr_access /
 				((aclk_clock() - start) / cpu_cycle_ms),
 				((aclk_clock() - start) / cpu_cycle_ms));
-
-	free(rndints);
 }
 
 void *thread_worker(void *arg) {
@@ -434,7 +421,7 @@ static void load_init_data(struct mregion *region)
 
 static void init_region(struct mregion *region)
 {
-	if (region->sz / num_threads < MIN_SUB_REGION_SZ) {
+	if (num_threads > 1 && region->sz / num_threads < MIN_SUB_REGION_SZ) {
 		fprintf(stderr, "Error: Region '%s' size (%zu) divided by threads (%d) is less than 2MB.\n",
 				region->name, region->sz, num_threads);
 		exit(1);
